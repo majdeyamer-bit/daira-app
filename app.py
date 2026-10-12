@@ -1,116 +1,141 @@
-from flask import Flask, request, jsonify, session, render_template_string, redirect
-import json, os
+from flask import Flask, render_template, request, jsonify, session, send_from_directory
+import json, os, time, base64
+from datetime import datetime
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.secret_key = "majdi-secret-123"
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 20 * 1024 * 1024 # 20MB
+
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 USERS_FILE="users.json"
 MSGS_FILE="msgs.json"
+ALLOWED_IMAGES={'png','jpg','jpeg','gif','webp'}
+ALLOWED_AUDIO={'mp3','wav','ogg','m4a','mp4','webm','aac','3gp'}
 
 def load_users():
     if os.path.exists(USERS_FILE):
         try:
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return {}
+            with open(USERS_FILE,"r",encoding="utf-8") as f: return json.load(f)
+        except: return {}
     return {}
-
-def save_users(u):
-    with open(USERS_FILE, "w", encoding="utf-8") as f:
-        json.dump(u, f, ensure_ascii=False, indent=2)
-
+def save_users(d):
+    with open(USERS_FILE,"w",encoding="utf-8") as f: json.dump(d,f,ensure_ascii=False,indent=2)
 def load_msgs():
     if os.path.exists(MSGS_FILE):
         try:
-            with open(MSGS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
+            with open(MSGS_FILE,"r",encoding="utf-8") as f: return json.load(f)
+        except: return []
     return []
+def save_msgs(d):
+    with open(MSGS_FILE,"w",encoding="utf-8") as f: json.dump(d,f[-300:],ensure_ascii=False,indent=2)
 
-def save_msgs(m):
-    with open(MSGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(m, f, ensure_ascii=False, indent=2)
-
-HTML="""
-<!DOCTYPE html><html dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>الدائرة</title>
-<style>body{font-family:system-ui;background:#0f172a;color:white;padding:20px}.card{background:#1e293b;padding:15px;border-radius:10px;margin:10px 0} input{padding:10px;width:70%;border-radius:5px;border:none} button{padding:10px 15px;background:#22c55e;border:none;border-radius:5px;cursor:pointer} #chat{height:300px;overflow-y:auto;background:#0f172a;border:1px solid #334155;padding:10px}</style>
-</head><body>
-<h2>🔒 الدائرة المغلقة</h2>
-{% if not session.username %}
-<div class="card"><h3>تسجيل دخول</h3>
-<input id="u" placeholder="اسم المستخدم"><input id="f" placeholder="الاسم الكامل">
-<button onclick="reg()">تسجيل</button><p id="st"></p></div>
-{% else %}
-<div class="card">مرحبا {{session.fullname}} - <a href="/logout" style="color:#f87171">خروج</a> {% if session.username=="مجدي" %} | <a href="/admin" style="color:yellow">الادمن</a>{% endif %}</div>
-<div class="card"><div id="chat"></div><br>
-<input id="msg" placeholder="اكتب..."><button onclick="send()">ارسال</button></div>
-{% endif %}
-<script>
-function reg(){fetch('/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('u').value,fullname:document.getElementById('f').value})}).then(r=>r.json()).then(d=>{document.getElementById('st').innerText=d.msg; if(d.ok) location.reload()})}
-function load(){fetch('/msgs').then(r=>r.json()).then(d=>{let c=document.getElementById('chat'); if(!c) return; c.innerHTML=d.map(m=>`<div><b>${m.user}:</b> ${m.text}</div>`).join(''); c.scrollTop=c.scrollHeight})}
-function send(){let t=document.getElementById('msg').value; if(!t) return; fetch('/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:t})}).then(()=>{document.getElementById('msg').value=''; load()})}
-setInterval(load,2000); load();
-</script></body></html>
-"""
+def allowed_file(name, types): return '.' in name and name.rsplit('.',1)[1].lower() in types
 
 @app.route("/")
-def home(): return render_template_string(HTML)
+def index(): return render_template("index.html")
 
-@app.route("/register", methods=["POST"])
-def register():
-    d=request.json; u=d.get("username","").strip(); f=d.get("fullname",u).strip()
-    if not u: return jsonify(msg="اكتب الاسم")
+@app.route("/api/login", methods=["POST"])
+def login():
+    data=request.get_json()
+    username=data.get("username","").strip()
+    if not username: return jsonify({"error":"اكتب اسمك"}),400
     users=load_users()
-    if u not in users:
-        users[u]={"fullname":f,"approved": (u=="مجدي")}
+    is_admin = len(users)==0
+    if username not in users:
+        users[username] = {"is_admin": is_admin, "banned": False, "joined": time.time()}
         save_users(users)
-        if u=="مجدي":
-            session["username"]=u; session["fullname"]=f
-            return jsonify(msg="تم",ok=True)
-        return jsonify(msg="انتظر موافقة الادمن")
-    else:
-        if not users[u].get("approved"): return jsonify(msg="انتظر موافقة الادمن")
-        session["username"]=u; session["fullname"]=users[u]["fullname"]
-        return jsonify(msg="تم",ok=True)
+    session["username"]=username
+    return jsonify({"ok":True,"is_admin": users[username].get("is_admin")})
 
-@app.route("/msgs")
-def get_msgs(): return jsonify(load_msgs())
+@app.route("/api/messages")
+def get_messages(): return jsonify(load_msgs())
 
-@app.route("/send", methods=["POST"])
-def send_msg():
-    if "username" not in session: return jsonify(msg="سجل دخول"),401
+@app.route("/api/send", methods=["POST"])
+def send():
+    if "username" not in session: return jsonify({"error":"login"}),401
+    username=session["username"]
     users=load_users()
-    if not users.get(session["username"],{}).get("approved"): return jsonify(msg="غير موافق"),403
-    t=request.json.get("text","").strip()
-    if not t: return jsonify(ok=True)
-    m=load_msgs()
-    m.append({"user":session.get("fullname"),"username":session.get("username"),"text":t})
-    save_msgs(m)
-    return jsonify(ok=True)
+    if users.get(username,{}).get("banned"): return jsonify({"error":"مطرود"}),403
+    data=request.get_json()
+    text=data.get("text","").strip()
+    if not text: return jsonify({"error":"فاضي"}),400
+    msgs=load_msgs()
+    msgs.append({"id": int(time.time()*1000), "user": username, "text": text, "type":"text", "time": datetime.now().strftime("%H:%M"), "reactions": {}, "is_admin": users.get(username,{}).get("is_admin",False)})
+    save_msgs(msgs)
+    return jsonify({"ok":True})
 
-@app.route("/logout")
-def logout(): session.clear(); return redirect("/")
-
-@app.route("/admin")
-def admin():
-    if session.get("username")!="مجدي": return "ممنوع"
-    users=load_users(); h='<h2>لوحة الادمن</h2><a href="/">رجوع</a><br><br>'
-    for k,v in users.items():
-        if not v.get("approved"):
-            h+=f'{k} ({v.get("fullname")}) <a href="/approve/{k}">[موافقة]</a><br>'
-    if h=='<h2>لوحة الادمن</h2><a href="/">رجوع</a><br><br>': h+='لا يوجد طلبات'
-    return h
-
-@app.route("/approve/<u>")
-def approve(u):
-    if session.get("username")!="مجدي": return "ممنوع"
+# --- رفع صور + صوتيات ---
+@app.route("/api/upload", methods=["POST"])
+def upload():
+    if "username" not in session: return jsonify({"error":"login"}),401
+    username=session["username"]
     users=load_users()
-    if u in users:
-        users[u]["approved"]=True
-        save_users(users)
-    return redirect("/admin")
+    if users.get(username,{}).get("banned"): return jsonify({"error":"مطرود"}),403
+    if 'file' not in request.files: return jsonify({"error":"مفيش ملف"}),400
+    file=request.files['file']
+    if file.filename=='' : return jsonify({"error":"مفيش ملف"}),400
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=10000)
+    ext=file.filename.rsplit('.',1)[1].lower() if '.' in file.filename else ''
+    if ext in ALLOWED_IMAGES: ftype='image'
+    elif ext in ALLOWED_AUDIO: ftype='audio'
+    else: return jsonify({"error":"نوع الملف مش مدعوم، صور و صوتيات بس"}),400
+
+    filename=f"{int(time.time()*1000)}_{secure_filename(file.filename)}"
+    path=os.path.join(app.config['UPLOAD_FOLDER'], filename)
+    file.save(path)
+
+    msgs=load_msgs()
+    msgs.append({
+        "id": int(time.time()*1000), "user": username, "text": f"/{app.config['UPLOAD_FOLDER']}/{filename}",
+        "type": ftype, "filename": file.filename, "time": datetime.now().strftime("%H:%M"),
+        "reactions": {}, "is_admin": users.get(username,{}).get("is_admin",False)
+    })
+    save_msgs(msgs)
+    return jsonify({"ok":True, "url": f"/{app.config['UPLOAD_FOLDER']}/{filename}", "type":ftype})
+
+@app.route('/static/uploads/<filename>')
+def uploaded_file(filename): return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+# --- مسح + طرد + رياكشن ---
+@app.route("/api/delete/<int:msg_id>", methods=["DELETE"])
+def delete_msg(msg_id):
+    if "username" not in session: return jsonify({"error":"login"}),401
+    username=session["username"]; users=load_users(); me=users.get(username,{})
+    msgs=load_msgs()
+    for m in msgs:
+        if m["id"]==msg_id:
+            if m["user"]==username or me.get("is_admin"):
+                save_msgs([x for x in msgs if x["id"]!=msg_id]); return jsonify({"ok":True})
+            else: return jsonify({"error":"مش مسموح"}),403
+    return jsonify({"error":"not found"}),404
+
+@app.route("/api/kick", methods=["POST"])
+def kick():
+    if "username" not in session: return jsonify({"error":"login"}),401
+    users=load_users()
+    if not users.get(session["username"],{}).get("is_admin"): return jsonify({"error":"مش ادمن"}),403
+    target=request.get_json().get("username")
+    if target in users and target!=session["username"]:
+        users[target]["banned"]=True; save_users(users); return jsonify({"ok":True})
+    return jsonify({"error":"not found"}),404
+
+@app.route("/api/react", methods=["POST"])
+def react():
+    if "username" not in session: return jsonify({"error":"login"}),401
+    username=session["username"]; data=request.get_json(); msg_id=data.get("msg_id"); emoji=data.get("emoji")
+    msgs=load_msgs()
+    for m in msgs:
+        if m["id"]==msg_id:
+            if emoji not in m["reactions"]: m["reactions"][emoji]=[]
+            if username in m["reactions"][emoji]: m["reactions"][emoji].remove(username)
+            else: m["reactions"][emoji].append(username)
+            save_msgs(msgs); return jsonify({"ok":True})
+    return jsonify({"error":"not found"}),404
+
+@app.route("/api/users")
+def list_users(): return jsonify(load_users())
+
+if __name__=="__main__": app.run(host="0.0.0.0",port=10000)
